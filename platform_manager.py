@@ -452,6 +452,72 @@ def q_most_privileged():
         FROM snowflake.account_usage.grants_to_users u JOIN rpv rp ON rp.role=u.role WHERE u.deleted_on IS NULL GROUP BY 1 ORDER BY 3 DESC LIMIT 20
     """)
 
+@st.cache_data(ttl=3600)
+def q_human_pwd_no_mfa():
+    return run_query("""SELECT name, email, has_rsa_public_key,
+        DATEDIFF('day', NVL(last_success_login, created_on), CURRENT_TIMESTAMP()) as days_since_login
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
+        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
+          AND (type IS NULL OR type='PERSON') AND has_password=TRUE AND has_mfa=FALSE
+        ORDER BY days_since_login""")
+
+@st.cache_data(ttl=3600)
+def q_service_pwd_auth():
+    return run_query("""SELECT name, has_rsa_public_key, default_role
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
+        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
+          AND type='SERVICE' AND has_password=TRUE
+        ORDER BY name""")
+
+@st.cache_data(ttl=3600)
+def q_default_aa():
+    return run_query("""SELECT name, COALESCE(type,'LEGACY') as user_type, email
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
+        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
+          AND default_role='ACCOUNTADMIN'
+        ORDER BY name""")
+
+@st.cache_data(ttl=3600)
+def q_user_network_policies():
+    return run_query("""WITH current_users AS (
+            SELECT name, type, email FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users
+            ) WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'),
+        user_np AS (
+            SELECT ref_entity_name as user_name, policy_name
+            FROM snowflake.account_usage.policy_references
+            WHERE policy_kind='NETWORK_POLICY' AND ref_entity_domain='USER' AND policy_status='ACTIVE')
+        SELECT u.name, COALESCE(u.type,'LEGACY') as user_type, u.email,
+               NVL(p.policy_name,'(account default)') as network_policy
+        FROM current_users u LEFT JOIN user_np p ON u.name=p.user_name
+        ORDER BY p.policy_name NULLS FIRST, u.name""")
+
+@st.cache_data(ttl=3600)
+def q_user_auth_policies():
+    return run_query("""WITH current_users AS (
+            SELECT name, type FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users
+            ) WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'),
+        acct_ap AS (
+            SELECT policy_name FROM snowflake.account_usage.policy_references
+            WHERE policy_kind='AUTHENTICATION_POLICY' AND ref_entity_domain='ACCOUNT' AND policy_status='ACTIVE' LIMIT 1),
+        user_ap AS (
+            SELECT ref_entity_name as user_name, policy_name
+            FROM snowflake.account_usage.policy_references
+            WHERE policy_kind='AUTHENTICATION_POLICY' AND ref_entity_domain='USER' AND policy_status='ACTIVE')
+        SELECT u.name, COALESCE(u.type,'LEGACY') as user_type,
+               NVL(p.policy_name, NVL(a.policy_name,'NONE')) as auth_policy
+        FROM current_users u LEFT JOIN user_ap p ON u.name=p.user_name LEFT JOIN acct_ap a ON TRUE
+        ORDER BY auth_policy, u.name""")
+
+@st.cache_data(ttl=3600)
+def q_legacy_user_types():
+    return run_query("""SELECT name, email, has_password, has_rsa_public_key, has_mfa
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
+        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
+          AND (type IS NULL OR type='')
+        ORDER BY name""")
+
 @st.cache_data(ttl=600)
 def q_config_changes(days, cm):
     c = "end_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"end_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
@@ -536,6 +602,12 @@ with _status_container.status("Loading platform metrics\u2026", expanded=False) 
     privileged_df       = q_most_privileged()
     config_df           = q_config_changes(days, cm)
     network_df          = q_network_policy_changes(days, cm)
+    human_no_mfa_df     = q_human_pwd_no_mfa()
+    svc_pwd_df          = q_service_pwd_auth()
+    default_aa_df       = q_default_aa()
+    user_net_pol_df     = q_user_network_policies()
+    user_auth_pol_df    = q_user_auth_policies()
+    legacy_type_df      = q_legacy_user_types()
 
     _status.update(label="Done", state="complete")
 _status_container.empty()
@@ -713,11 +785,12 @@ with tab_wh:
 # ── Security ───────────────────────────────────────────────────────────────────
 
 with tab_sec:
-    s1, s2, s3, s4, s5 = st.tabs([
+    s1, s2, s3, s4, s5, s6 = st.tabs([
         ":material/lock: Authentication",
         ":material/admin_panel_settings: Privileged access",
         ":material/person: Identity management",
         ":material/shield: Least privilege",
+        ":material/verified_user: Posture",
         ":material/build: Configuration",
     ])
 
@@ -785,6 +858,67 @@ with tab_sec:
                 })
 
     with s5:
+        col1, col2 = st.columns(2)
+        with col1:
+            if not human_no_mfa_df.empty:
+                with st.container(border=True):
+                    st.subheader(":material/warning: Human users with password but no MFA")
+                    st.dataframe(human_no_mfa_df, hide_index=True, use_container_width=True, column_config={
+                        "name": "User", "email": "Email",
+                        "has_rsa_public_key": st.column_config.CheckboxColumn("RSA key"),
+                        "days_since_login": st.column_config.NumberColumn("Days since login", format="%d"),
+                    })
+            else:
+                st.caption(":material/check_circle: All human users with passwords have MFA enabled.")
+        with col2:
+            if not svc_pwd_df.empty:
+                with st.container(border=True):
+                    st.subheader(":material/warning: Service accounts using password auth")
+                    st.caption("Service accounts should use key-pair authentication.")
+                    st.dataframe(svc_pwd_df, hide_index=True, use_container_width=True, column_config={
+                        "name": "User",
+                        "has_rsa_public_key": st.column_config.CheckboxColumn("RSA key"),
+                        "default_role": "Default role",
+                    })
+            else:
+                st.caption(":material/check_circle: No service accounts using password authentication.")
+        col3, col4 = st.columns(2)
+        with col3:
+            if not default_aa_df.empty:
+                with st.container(border=True):
+                    st.subheader(":material/warning: Users with default role ACCOUNTADMIN")
+                    st.dataframe(default_aa_df, hide_index=True, use_container_width=True, column_config={
+                        "name": "User", "user_type": "Type", "email": "Email",
+                    })
+            else:
+                st.caption(":material/check_circle: No users have ACCOUNTADMIN as their default role.")
+        with col4:
+            if not legacy_type_df.empty:
+                with st.container(border=True):
+                    st.subheader(":material/info: Users without a user type set")
+                    st.caption("Users should have TYPE set to PERSON or SERVICE.")
+                    st.dataframe(legacy_type_df, hide_index=True, use_container_width=True, column_config={
+                        "name": "User", "email": "Email",
+                        "has_password": st.column_config.CheckboxColumn("Password"),
+                        "has_rsa_public_key": st.column_config.CheckboxColumn("RSA key"),
+                        "has_mfa": st.column_config.CheckboxColumn("MFA"),
+                    })
+            else:
+                st.caption(":material/check_circle: All users have a TYPE set.")
+        if not user_net_pol_df.empty:
+            with st.container(border=True):
+                st.subheader("Network policy assignments")
+                st.dataframe(user_net_pol_df, hide_index=True, use_container_width=True, column_config={
+                    "name": "User", "user_type": "Type", "email": "Email", "network_policy": "Network policy",
+                })
+        if not user_auth_pol_df.empty:
+            with st.container(border=True):
+                st.subheader("Authentication policy assignments")
+                st.dataframe(user_auth_pol_df, hide_index=True, use_container_width=True, column_config={
+                    "name": "User", "user_type": "Type", "auth_policy": "Auth policy",
+                })
+
+    with s6:
         if not config_df.empty:
             with st.container(border=True):
                 st.subheader("Privileged object changes")
