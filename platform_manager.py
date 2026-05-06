@@ -13,6 +13,7 @@ st.set_page_config(
 
 CHART_HEIGHT       = 300
 SMALL_CHART_HEIGHT = 260
+_PLOTLY_CONFIG     = {"displayModeBar": False}
 
 DATE_RANGES: dict = {
     "1 week":        {"days": 7,    "trunc": "day",   "tick": "%b %d"},
@@ -84,7 +85,6 @@ def hbar(df, x, y, title="", height=SMALL_CHART_HEIGHT):
 
 
 def _top_n_other(df: pd.DataFrame, group_col: str, value_col: str, n: int = 8) -> pd.DataFrame:
-    """Keep top-N series by total value; collapse the rest into 'Other'."""
     if df.empty or group_col not in df.columns:
         return df
     top = df.groupby(group_col)[value_col].sum().nlargest(n).index
@@ -100,7 +100,7 @@ def chart_card(df, fig_fn, *args, empty_label: str = "", **kwargs):
         if title:
             st.markdown(f"**{title}**")
         if not df.empty:
-            st.plotly_chart(fig_fn(df, *args, **kwargs), use_container_width=True)
+            st.plotly_chart(fig_fn(df, *args, **kwargs), use_container_width=True, config=_PLOTLY_CONFIG)
         else:
             if len(df.columns) == 0:
                 st.caption(":material/error: Query failed — check ACCOUNT_USAGE privileges.")
@@ -121,12 +121,6 @@ tick  = cfg["tick"]
 trunc = cfg["trunc"]
 days  = cfg.get("days", 30)
 cm    = cfg.get("current_month", False)
-
-# ── SQL condition helpers ──────────────────────────────────────────────────────
-
-def _ts(col):   return f"{col} >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"{col} > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-def _dt(col):   return f"{col} >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"{col} > CURRENT_DATE - {days}"
-def _ts_q(col): return f"{col} >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"{col} > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
 
 # ── Query functions ────────────────────────────────────────────────────────────
 # Overview
@@ -284,93 +278,51 @@ def q_largest_schemas():
 def q_largest_tables():
     return run_query("SELECT table_catalog||'.'||table_schema||'.'||table_name as table_name, SUM(active_bytes) as total_bytes FROM snowflake.account_usage.table_storage_metrics GROUP BY 1 ORDER BY 2 DESC LIMIT 15")
 
-# FinOps
+# FinOps — combined attribution query
 
 @st.cache_data(ttl=600)
-def q_cost_by_role(trunc, days, cm):
+def q_finops_combined(trunc, days, cm):
     wh = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
     qh = "q.start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"q.start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
     return run_query(f"""
-        WITH wh AS (SELECT warehouse_name, DATE_TRUNC('{trunc}', start_time) as period, SUM(credits_used) as wh_credits FROM snowflake.account_usage.warehouse_metering_history WHERE {wh} GROUP BY 1,2),
-        rt AS (SELECT q.role_name, q.warehouse_name, DATE_TRUNC('{trunc}', q.start_time) as period, SUM(q.execution_time) as ms FROM snowflake.account_usage.query_history q WHERE {qh} AND q.warehouse_name IS NOT NULL AND q.execution_status='SUCCESS' GROUP BY 1,2,3),
-        wt AS (SELECT warehouse_name, period, SUM(ms) as total_ms FROM rt GROUP BY 1,2)
-        SELECT r.role_name, r.period, ROUND(SUM(r.ms/NULLIF(t.total_ms,0)*w.wh_credits),4) as attributed_credits
-        FROM rt r JOIN wt t ON r.warehouse_name=t.warehouse_name AND r.period=t.period JOIN wh w ON r.warehouse_name=w.warehouse_name AND r.period=w.period
-        GROUP BY 1,2 ORDER BY 1,2
+        WITH wh AS (
+            SELECT warehouse_name, DATE_TRUNC('{trunc}', start_time) as period, SUM(credits_used) as wh_credits
+            FROM snowflake.account_usage.warehouse_metering_history WHERE {wh} GROUP BY 1,2
+        ),
+        base AS (
+            SELECT q.role_name, q.query_type, q.user_name,
+                   TRIM(NVL(l.reported_client_type,'')||' '||COALESCE(l.reported_client_version,'')) as client,
+                   q.warehouse_name, DATE_TRUNC('{trunc}', q.start_time) as period, SUM(q.execution_time) as ms
+            FROM snowflake.account_usage.query_history q
+            LEFT JOIN snowflake.account_usage.login_history l ON q.authn_event_id=l.event_id
+            WHERE {qh} AND q.warehouse_name IS NOT NULL AND q.execution_status='SUCCESS'
+            GROUP BY 1,2,3,4,5,6
+        ),
+        wt AS (SELECT warehouse_name, period, SUM(ms) as total_ms FROM base GROUP BY 1,2)
+        SELECT b.role_name, b.query_type, b.user_name, b.client, b.period,
+               ROUND(SUM(b.ms/NULLIF(t.total_ms,0)*w.wh_credits),4) as attributed_credits
+        FROM base b
+        JOIN wt t ON b.warehouse_name=t.warehouse_name AND b.period=t.period
+        JOIN wh w ON b.warehouse_name=w.warehouse_name AND b.period=w.period
+        GROUP BY ALL ORDER BY b.period
     """)
 
-@st.cache_data(ttl=600)
-def q_cost_by_query_type(trunc, days, cm):
-    wh = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    qh = "q.start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"q.start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    return run_query(f"""
-        WITH wh AS (SELECT warehouse_name, DATE_TRUNC('{trunc}', start_time) as period, SUM(credits_used) as wh_credits FROM snowflake.account_usage.warehouse_metering_history WHERE {wh} GROUP BY 1,2),
-        qt AS (SELECT q.query_type, q.warehouse_name, DATE_TRUNC('{trunc}', q.start_time) as period, SUM(q.execution_time) as ms FROM snowflake.account_usage.query_history q WHERE {qh} AND q.warehouse_name IS NOT NULL AND q.execution_status='SUCCESS' GROUP BY 1,2,3),
-        wt AS (SELECT warehouse_name, period, SUM(ms) as total_ms FROM qt GROUP BY 1,2)
-        SELECT t.query_type, t.period, ROUND(SUM(t.ms/NULLIF(w2.total_ms,0)*w.wh_credits),4) as attributed_credits
-        FROM qt t JOIN wt w2 ON t.warehouse_name=w2.warehouse_name AND t.period=w2.period JOIN wh w ON t.warehouse_name=w.warehouse_name AND t.period=w.period
-        GROUP BY 1,2 ORDER BY 1,2
-    """)
+# Warehouse performance — combined query_history scan
 
 @st.cache_data(ttl=600)
-def q_cost_by_client(trunc, days, cm):
-    wh = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    qh = "q.start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"q.start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    return run_query(f"""
-        WITH wh AS (SELECT warehouse_name, DATE_TRUNC('{trunc}', start_time) as period, SUM(credits_used) as wh_credits FROM snowflake.account_usage.warehouse_metering_history WHERE {wh} GROUP BY 1,2),
-        ct AS (SELECT TRIM(l.reported_client_type||' '||COALESCE(l.reported_client_version,'')) as client, q.warehouse_name, DATE_TRUNC('{trunc}', q.start_time) as period, SUM(q.execution_time) as ms
-               FROM snowflake.account_usage.query_history q JOIN snowflake.account_usage.login_history l ON q.authn_event_id=l.event_id
-               WHERE {qh} AND q.warehouse_name IS NOT NULL AND q.execution_status='SUCCESS' GROUP BY 1,2,3),
-        wt AS (SELECT warehouse_name, period, SUM(ms) as total_ms FROM ct GROUP BY 1,2)
-        SELECT c.client, c.period, ROUND(SUM(c.ms/NULLIF(t.total_ms,0)*w.wh_credits),4) as attributed_credits
-        FROM ct c JOIN wt t ON c.warehouse_name=t.warehouse_name AND c.period=t.period JOIN wh w ON c.warehouse_name=w.warehouse_name AND c.period=w.period
-        GROUP BY 1,2 ORDER BY 1,2
-    """)
-
-@st.cache_data(ttl=600)
-def q_cost_by_user(trunc, days, cm):
-    wh = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    qh = "q.start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"q.start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    return run_query(f"""
-        WITH wh AS (SELECT warehouse_name, DATE_TRUNC('{trunc}', start_time) as period, SUM(credits_used) as wh_credits FROM snowflake.account_usage.warehouse_metering_history WHERE {wh} GROUP BY 1,2),
-        ut AS (SELECT q.user_name, q.warehouse_name, DATE_TRUNC('{trunc}', q.start_time) as period, SUM(q.execution_time) as ms FROM snowflake.account_usage.query_history q WHERE {qh} AND q.warehouse_name IS NOT NULL AND q.execution_status='SUCCESS' GROUP BY 1,2,3),
-        wt AS (SELECT warehouse_name, period, SUM(ms) as total_ms FROM ut GROUP BY 1,2)
-        SELECT u.user_name, u.period, ROUND(SUM(u.ms/NULLIF(t.total_ms,0)*w.wh_credits),4) as attributed_credits
-        FROM ut u JOIN wt t ON u.warehouse_name=t.warehouse_name AND u.period=t.period JOIN wh w ON u.warehouse_name=w.warehouse_name AND u.period=w.period
-        GROUP BY 1,2 ORDER BY 1,2
-    """)
-
-# Warehouse performance
-
-@st.cache_data(ttl=600)
-def q_queuing_trend(trunc, days, cm):
+def q_wh_perf_combined(trunc, days, cm):
     c = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
     return run_query(f"""
-        SELECT DATE_TRUNC('{trunc}', start_time) as period, warehouse_name,
+        SELECT DATE_TRUNC('{trunc}', start_time) as period, warehouse_name, warehouse_size,
+               COUNT(*) as total_queries,
                SUM(CASE WHEN queued_overload_time>0 THEN 1 ELSE 0 END) as queued_count,
-               ROUND(AVG(queued_overload_time)/1000.0,2) as avg_overload_wait_sec
-        FROM snowflake.account_usage.query_history WHERE {c} AND warehouse_name IS NOT NULL GROUP BY ALL ORDER BY 1,2
-    """)
-
-@st.cache_data(ttl=600)
-def q_queuing_summary(days, cm):
-    c = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    return run_query(f"""
-        SELECT warehouse_name, warehouse_size, COUNT(*) as total_queries,
-               SUM(CASE WHEN queued_overload_time>0 THEN 1 ELSE 0 END) as queued_queries,
-               ROUND(100.0*SUM(CASE WHEN queued_overload_time>0 THEN 1 ELSE 0 END)/COUNT(*),1) as pct_queued,
-               ROUND(AVG(queued_overload_time)/1000.0,2) as avg_wait_sec
-        FROM snowflake.account_usage.query_history WHERE {c} AND warehouse_name IS NOT NULL GROUP BY 1,2 ORDER BY pct_queued DESC
-    """)
-
-@st.cache_data(ttl=600)
-def q_spilling(days, cm):
-    c = "start_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"start_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
-    return run_query(f"""
-        SELECT warehouse_name, warehouse_size, COUNT(*) as spilling_queries,
+               ROUND(AVG(queued_overload_time)/1000.0,2) as avg_overload_wait_sec,
+               SUM(CASE WHEN bytes_spilled_to_remote_storage>0 THEN 1 ELSE 0 END) as spilling_queries,
                ROUND(SUM(bytes_spilled_to_remote_storage)/1e9,2) as remote_spill_gb,
-               ROUND(SUM(bytes_spilled_to_local_storage)/1e9,2)  as local_spill_gb
-        FROM snowflake.account_usage.query_history WHERE {c} AND bytes_spilled_to_remote_storage>0 GROUP BY 1,2 ORDER BY remote_spill_gb DESC
+               ROUND(SUM(bytes_spilled_to_local_storage)/1e9,2) as local_spill_gb
+        FROM snowflake.account_usage.query_history
+        WHERE {c} AND warehouse_name IS NOT NULL
+        GROUP BY 1,2,3 ORDER BY 1,2
     """)
 
 @st.cache_data(ttl=600)
@@ -392,7 +344,15 @@ def q_top_cost_queries(days, cm):
         ORDER BY attributed_credits DESC NULLS LAST LIMIT 10
     """)
 
-# Security
+# Security — combined user base query
+
+@st.cache_data(ttl=3600)
+def q_user_base():
+    return run_query("""SELECT name, type, email, has_password, has_rsa_public_key, has_mfa, ext_authn_duo,
+        default_role, disabled, deleted_on, last_success_login, password_last_set_time, created_on
+        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn
+              FROM snowflake.account_usage.users)
+        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'""")
 
 @st.cache_data(ttl=600)
 def q_login_failures_trend(trunc, days, cm):
@@ -419,25 +379,6 @@ def q_aa_no_mfa():
     return run_query("SELECT u.name, TIMEDIFF('day',last_success_login,CURRENT_TIMESTAMP())||' days ago' as last_login, TIMEDIFF('day',password_last_set_time,CURRENT_TIMESTAMP())||' days ago' as password_age FROM snowflake.account_usage.users u JOIN snowflake.account_usage.grants_to_users g ON g.grantee_name=u.name AND g.role='ACCOUNTADMIN' AND g.deleted_on IS NULL WHERE u.ext_authn_duo=FALSE AND u.deleted_on IS NULL AND u.has_password=TRUE ORDER BY last_success_login DESC")
 
 @st.cache_data(ttl=3600)
-def q_stale_users(threshold):
-    return run_query(f"""SELECT name, days_since_login FROM (
-        SELECT name, DATEDIFF('day',NVL(last_success_login,created_on),CURRENT_TIMESTAMP()) as days_since_login, deleted_on, disabled
-        FROM snowflake.account_usage.users
-        WHERE name != 'SNOWFLAKE'
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) = 1)
-        WHERE deleted_on IS NULL AND disabled = FALSE AND days_since_login >= {threshold}
-        ORDER BY days_since_login DESC LIMIT 50""")
-
-@st.cache_data(ttl=3600)
-def q_old_passwords():
-    return run_query("""SELECT name, password_age_days FROM (
-        SELECT name, DATEDIFF('day',password_last_set_time,CURRENT_TIMESTAMP()) as password_age_days, deleted_on, disabled, password_last_set_time
-        FROM snowflake.account_usage.users
-        QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) = 1)
-        WHERE deleted_on IS NULL AND disabled = FALSE AND password_last_set_time IS NOT NULL
-        ORDER BY password_age_days DESC LIMIT 30""")
-
-@st.cache_data(ttl=3600)
 def q_most_privileged():
     return run_query("""
         WITH rh AS (
@@ -451,31 +392,6 @@ def q_most_privileged():
         SELECT u.grantee_name as user_name, COUNT(rp.role) as num_roles, SUM(rp.num_privs) as num_privs
         FROM snowflake.account_usage.grants_to_users u JOIN rpv rp ON rp.role=u.role WHERE u.deleted_on IS NULL GROUP BY 1 ORDER BY 3 DESC LIMIT 20
     """)
-
-@st.cache_data(ttl=3600)
-def q_human_pwd_no_mfa():
-    return run_query("""SELECT name, email, has_rsa_public_key,
-        DATEDIFF('day', NVL(last_success_login, created_on), CURRENT_TIMESTAMP()) as days_since_login
-        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
-        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
-          AND (type IS NULL OR type='PERSON') AND has_password=TRUE AND has_mfa=FALSE
-        ORDER BY days_since_login""")
-
-@st.cache_data(ttl=3600)
-def q_service_pwd_auth():
-    return run_query("""SELECT name, has_rsa_public_key, default_role
-        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
-        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
-          AND type='SERVICE' AND has_password=TRUE
-        ORDER BY name""")
-
-@st.cache_data(ttl=3600)
-def q_default_aa():
-    return run_query("""SELECT name, COALESCE(type,'LEGACY') as user_type, email
-        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
-        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
-          AND default_role='ACCOUNTADMIN'
-        ORDER BY name""")
 
 @st.cache_data(ttl=3600)
 def q_user_network_policies():
@@ -510,14 +426,6 @@ def q_user_auth_policies():
         FROM current_users u LEFT JOIN user_ap p ON u.name=p.user_name LEFT JOIN acct_ap a ON TRUE
         ORDER BY auth_policy, u.name""")
 
-@st.cache_data(ttl=3600)
-def q_legacy_user_types():
-    return run_query("""SELECT name, email, has_password, has_rsa_public_key, has_mfa
-        FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY name ORDER BY created_on DESC) as rn FROM snowflake.account_usage.users)
-        WHERE rn=1 AND deleted_on IS NULL AND disabled=FALSE AND name!='SNOWFLAKE'
-          AND (type IS NULL OR type='')
-        ORDER BY name""")
-
 @st.cache_data(ttl=600)
 def q_config_changes(days, cm):
     c = "end_time >= DATE_TRUNC('month', CURRENT_DATE)" if cm else f"end_time > CURRENT_TIMESTAMP - INTERVAL '{days} days'"
@@ -538,101 +446,32 @@ def q_network_policy_changes(days, cm):
             OR query_text ILIKE '% set network_policy%' OR query_text ILIKE '% unset network_policy%')
         ORDER BY end_time DESC""")
 
-# ── Load data ──────────────────────────────────────────────────────────────────
-
-_status_container = st.empty()
-with _status_container.status("Loading platform metrics\u2026", expanded=False) as _status:
-    _status.update(label="Loading overview metrics\u2026")
-    kpi_df            = q_kpi(days, cm)
-    kpi_prior_df      = q_kpi_prior(days, cm)
-    storage_kpi_df    = q_storage_kpi()
-    metering_df       = q_metering(trunc, days, cm)
-    warehouse_df      = q_warehouse(trunc, days, cm)
-    storage_trend_df  = q_storage_trend(trunc, days, cm)
-
-    _status.update(label="Loading AI & Cortex costs\u2026")
-    cortex_analyst_df   = q_cortex_analyst(trunc, days, cm)
-    cortex_functions_df = q_cortex_functions(trunc, days, cm)
-    cortex_search_df    = q_cortex_search(trunc, days, cm)
-    doc_ai_df           = q_doc_ai(trunc, days, cm)
-    sf_intelligence_df  = q_sf_intelligence(trunc, days, cm)
-    cortex_agent_df     = q_cortex_agent(trunc, days, cm)
-    cortex_ft_df        = q_cortex_fine_tuning(trunc, days, cm)
-
-    _status.update(label="Loading serverless & compute costs\u2026")
-    serverless_df       = q_serverless(trunc, days, cm)
-    dmf_df              = q_dmf(trunc, days, cm)
-    event_df            = q_event_usage(trunc, days, cm)
-    spcs_df             = q_spcs(trunc, days, cm)
-    application_df      = q_application(trunc, days, cm)
-    pipe_df             = q_pipe_usage(trunc, days, cm)
-    auto_cluster_df     = q_auto_clustering(trunc, days, cm)
-    mv_refresh_df       = q_mv_refresh(trunc, days, cm)
-    search_opt_df       = q_search_optimization(trunc, days, cm)
-    query_accel_df      = q_query_acceleration(trunc, days, cm)
-
-    _status.update(label="Loading storage & transfer costs\u2026")
-    data_transfer_df    = q_data_transfer(trunc, days, cm)
-    replication_df      = q_replication(trunc, days, cm)
-    stage_storage_df    = q_stage_storage(trunc, days, cm)
-    storage_db_df       = q_storage_by_db(trunc, days, cm)
-    schemas_df          = q_largest_schemas()
-    tables_df           = q_largest_tables()
-
-    _status.update(label="Loading FinOps attribution\u2026")
-    role_df             = q_cost_by_role(trunc, days, cm)
-    query_type_df       = q_cost_by_query_type(trunc, days, cm)
-    client_df           = q_cost_by_client(trunc, days, cm)
-    user_df             = q_cost_by_user(trunc, days, cm)
-
-    _status.update(label="Loading warehouse performance\u2026")
-    queuing_trend_df    = q_queuing_trend(trunc, days, cm)
-    queuing_summary_df  = q_queuing_summary(days, cm)
-    spilling_df         = q_spilling(days, cm)
-    top_cost_df         = q_top_cost_queries(days, cm)
-
-    _status.update(label="Loading security data\u2026")
-    failures_trend_df   = q_login_failures_trend(trunc, days, cm)
-    failures_detail_df  = q_login_failures_detail(days, cm)
-    auth_methods_df     = q_auth_methods(days, cm)
-    aa_grants_df        = q_aa_grants(days, cm)
-    aa_no_mfa_df        = q_aa_no_mfa()
-    stale_df            = q_stale_users(stale_threshold)
-    old_pwd_df          = q_old_passwords()
-    privileged_df       = q_most_privileged()
-    config_df           = q_config_changes(days, cm)
-    network_df          = q_network_policy_changes(days, cm)
-    human_no_mfa_df     = q_human_pwd_no_mfa()
-    svc_pwd_df          = q_service_pwd_auth()
-    default_aa_df       = q_default_aa()
-    user_net_pol_df     = q_user_network_policies()
-    user_auth_pol_df    = q_user_auth_policies()
-    legacy_type_df      = q_legacy_user_types()
-
-    _status.update(label="Done", state="complete")
-_status_container.empty()
-
 # ── Render ─────────────────────────────────────────────────────────────────────
 
-tab_overview, tab_detail, tab_finops, tab_wh, tab_sec = st.tabs([
-    ":material/home: Overview",
-    ":material/bar_chart: Detailed costs",
-    ":material/account_balance: FinOps",
-    ":material/speed: Warehouse performance",
-    ":material/security: Security",
-])
+_TAB_LABELS = [":material/home: Overview", ":material/bar_chart: Detailed costs",
+               ":material/account_balance: FinOps", ":material/speed: Warehouse performance",
+               ":material/security: Security"]
+_active_tab = st.radio("Section", _TAB_LABELS, horizontal=True, label_visibility="collapsed")
 
 # ── Overview ───────────────────────────────────────────────────────────────────
 
-with tab_overview:
+if _active_tab == _TAB_LABELS[0]:
+    with st.spinner("Loading overview…"):
+        kpi_df         = q_kpi(days, cm)
+        kpi_prior_df   = q_kpi_prior(days, cm)
+        storage_kpi_df = q_storage_kpi()
+        metering_df    = q_metering(trunc, days, cm)
+        warehouse_df   = q_warehouse(trunc, days, cm)
+        storage_trend_df = q_storage_trend(trunc, days, cm)
+
     total_credits = float(kpi_df["total_credits"].iloc[0]) if not kpi_df.empty and not pd.isna(kpi_df["total_credits"].iloc[0]) else 0.0
     total_tb      = float(storage_kpi_df["total_tb"].iloc[0]) if not storage_kpi_df.empty and not pd.isna(storage_kpi_df["total_tb"].iloc[0]) else 0.0
 
     prior_credits = float(kpi_prior_df["total_credits"].iloc[0]) if not kpi_prior_df.empty and not pd.isna(kpi_prior_df["total_credits"].iloc[0]) else None
     if prior_credits and prior_credits > 0:
-        _delta_pct       = (total_credits - prior_credits) / prior_credits * 100
-        _delta_label     = f"{_delta_pct:+.1f}% vs prior period"
-        _delta_inv       = True
+        _delta_pct   = (total_credits - prior_credits) / prior_credits * 100
+        _delta_label = f"{_delta_pct:+.1f}% vs prior period"
+        _delta_inv   = True
     else:
         _delta_label = None
         _delta_inv   = False
@@ -643,7 +482,7 @@ with tab_overview:
     projected_credits = (total_credits / _days_elapsed * _days_in_month) if cm and _days_elapsed > 0 else None
 
     with st.container(horizontal=True):
-        st.metric("Credits used",    f"{total_credits:,.1f}",
+        st.metric("Credits used", f"{total_credits:,.1f}",
                   delta=_delta_label, delta_color="inverse" if _delta_inv else "off", border=True)
         st.metric("Current storage", f"{total_tb:.2f} TB", border=True)
         if projected_credits is not None:
@@ -655,7 +494,7 @@ with tab_overview:
     with st.container(border=True):
         st.subheader("Credit usage by service type")
         if not metering_df.empty:
-            st.plotly_chart(bar(metering_df, "period", "credits_used", "service_type", height=CHART_HEIGHT, tick=tick), use_container_width=True)
+            st.plotly_chart(bar(metering_df, "period", "credits_used", "service_type", height=CHART_HEIGHT, tick=tick), use_container_width=True, config=_PLOTLY_CONFIG)
         else:
             st.caption("No data available.")
 
@@ -667,15 +506,23 @@ with tab_overview:
 
 # ── Detailed costs ─────────────────────────────────────────────────────────────
 
-with tab_detail:
+elif _active_tab == _TAB_LABELS[1]:
     d1, d2, d3, d4, d5 = st.tabs([":material/robot_2: AI & Cortex", ":material/bolt: Serverless & compute", ":material/storage: Storage", ":material/sync: Transfer & replication", ":material/apps: Applications"])
 
     with d1:
+        with st.spinner("Loading AI & Cortex costs…"):
+            cortex_analyst_df   = q_cortex_analyst(trunc, days, cm)
+            cortex_functions_df = q_cortex_functions(trunc, days, cm)
+            cortex_search_df    = q_cortex_search(trunc, days, cm)
+            doc_ai_df           = q_doc_ai(trunc, days, cm)
+            sf_intelligence_df  = q_sf_intelligence(trunc, days, cm)
+            cortex_agent_df     = q_cortex_agent(trunc, days, cm)
+            cortex_ft_df        = q_cortex_fine_tuning(trunc, days, cm)
         col1, col2 = st.columns(2)
         with col1:  chart_card(cortex_analyst_df, bar, "period", "credits_used", title="Cortex Analyst", tick=tick)
-        with col2:  chart_card(_top_n_other(cortex_functions_df, "model_name",   "credits_used"), bar, "period", "credits_used", "model_name",   title="Cortex Functions", tick=tick)
+        with col2:  chart_card(_top_n_other(cortex_functions_df, "model_name", "credits_used"), bar, "period", "credits_used", "model_name", title="Cortex Functions", tick=tick)
         col3, col4 = st.columns(2)
-        with col3:  chart_card(_top_n_other(cortex_search_df,    "service_name", "credits_used"), bar, "period", "credits_used", "service_name", title="Cortex Search",    tick=tick)
+        with col3:  chart_card(_top_n_other(cortex_search_df, "service_name", "credits_used"), bar, "period", "credits_used", "service_name", title="Cortex Search", tick=tick)
         with col4:  chart_card(doc_ai_df, bar, "period", "credits_used", "operation_name", title="Document AI", tick=tick)
         col5, col6 = st.columns(2)
         with col5:  chart_card(_top_n_other(sf_intelligence_df, "snowflake_intelligence_name", "credits_used"), bar, "period", "credits_used", "snowflake_intelligence_name", title="Snowflake Intelligence", tick=tick)
@@ -685,12 +532,22 @@ with tab_detail:
         with col8:  st.empty()
 
     with d2:
+        with st.spinner("Loading serverless costs…"):
+            serverless_df  = q_serverless(trunc, days, cm)
+            dmf_df         = q_dmf(trunc, days, cm)
+            event_df       = q_event_usage(trunc, days, cm)
+            spcs_df        = q_spcs(trunc, days, cm)
+            pipe_df        = q_pipe_usage(trunc, days, cm)
+            auto_cluster_df = q_auto_clustering(trunc, days, cm)
+            mv_refresh_df  = q_mv_refresh(trunc, days, cm)
+            search_opt_df  = q_search_optimization(trunc, days, cm)
+            query_accel_df = q_query_acceleration(trunc, days, cm)
         col1, col2 = st.columns(2)
-        with col1:  chart_card(_top_n_other(serverless_df, "task_name",        "credits_used"), bar, "period", "credits_used", "task_name",         title="Serverless tasks",   tick=tick)
-        with col2:  chart_card(_top_n_other(dmf_df,        "table_name",       "credits_used"), bar, "period", "credits_used", "table_name",        title="Data quality (DMF)", tick=tick)
+        with col1:  chart_card(_top_n_other(serverless_df, "task_name", "credits_used"), bar, "period", "credits_used", "task_name", title="Serverless tasks", tick=tick)
+        with col2:  chart_card(_top_n_other(dmf_df, "table_name", "credits_used"), bar, "period", "credits_used", "table_name", title="Data quality (DMF)", tick=tick)
         col3, col4 = st.columns(2)
         with col3:  chart_card(event_df, bar, "period", "credits_used", title="Event usage", tick=tick)
-        with col4:  chart_card(_top_n_other(spcs_df, "compute_pool_name", "credits_used"),    bar, "period", "credits_used", "compute_pool_name", title="SPCS",               tick=tick)
+        with col4:  chart_card(_top_n_other(spcs_df, "compute_pool_name", "credits_used"), bar, "period", "credits_used", "compute_pool_name", title="SPCS", tick=tick)
         col5, col6 = st.columns(2)
         with col5:  chart_card(_top_n_other(pipe_df, "pipe_name", "credits_used"), bar, "period", "credits_used", "pipe_name", title="Snowpipe", tick=tick)
         with col6:  chart_card(_top_n_other(auto_cluster_df, "table_name", "credits_used"), bar, "period", "credits_used", "table_name", title="Automatic clustering", tick=tick)
@@ -702,28 +559,49 @@ with tab_detail:
         with col10: st.empty()
 
     with d3:
+        with st.spinner("Loading storage costs…"):
+            storage_db_df    = q_storage_by_db(trunc, days, cm)
+            stage_storage_df = q_stage_storage(trunc, days, cm)
+            schemas_df       = q_largest_schemas()
+            tables_df        = q_largest_tables()
         col1, col2 = st.columns(2)
         with col1:  chart_card(_top_n_other(storage_db_df, "database_name", "avg_bytes"), area, "period", "avg_bytes", "database_name", title="Storage by database (bytes)", tick=tick)
         with col2:  chart_card(stage_storage_df, area, "period", "stage_gb", title="Stage storage (GB)", tick=tick)
         col3, col4 = st.columns(2)
         with col3:  chart_card(schemas_df, hbar, "total_bytes", "schema_name", title="Largest schemas (bytes)")
-        with col4:  chart_card(tables_df,  hbar, "total_bytes", "table_name",  title="Largest tables (bytes)")
+        with col4:  chart_card(tables_df, hbar, "total_bytes", "table_name", title="Largest tables (bytes)")
 
     with d4:
+        with st.spinner("Loading transfer & replication…"):
+            data_transfer_df = q_data_transfer(trunc, days, cm)
+            replication_df   = q_replication(trunc, days, cm)
         col1, col2 = st.columns(2)
         with col1:  chart_card(data_transfer_df, bar, "period", "gb_transferred", "transfer_type", title="Data transfer (GB)", tick=tick)
         with col2:  chart_card(_top_n_other(replication_df, "replication_group_name", "credits_used"), bar, "period", "credits_used", "replication_group_name", title="Replication credits", tick=tick)
 
     with d5:
+        with st.spinner("Loading application costs…"):
+            application_df = q_application(trunc, days, cm)
         chart_card(application_df, bar, "period", "credits_used", "application_name", title="Application credits", tick=tick)
 
 # ── FinOps ─────────────────────────────────────────────────────────────────────
 
-with tab_finops:
+elif _active_tab == _TAB_LABELS[2]:
     st.caption(":material/info: Credit attribution is estimated by proportioning warehouse credits across queries by execution time. These are not actual billed costs.")
+    with st.spinner("Loading FinOps attribution…"):
+        finops_df = q_finops_combined(trunc, days, cm)
+
+    if not finops_df.empty:
+        role_df       = finops_df.groupby(["role_name", "period"], as_index=False)["attributed_credits"].sum()
+        query_type_df = finops_df.groupby(["query_type", "period"], as_index=False)["attributed_credits"].sum()
+        user_df       = finops_df.groupby(["user_name", "period"], as_index=False)["attributed_credits"].sum()
+        client_df     = finops_df.groupby(["client", "period"], as_index=False)["attributed_credits"].sum()
+    else:
+        role_df = query_type_df = user_df = client_df = pd.DataFrame()
+
     col1, col2 = st.columns(2)
     with col1:
-        chart_card(_top_n_other(role_df,  "role_name", "attributed_credits"), bar, "period", "attributed_credits", "role_name", title="Estimated credits by role",      tick=tick)
+        chart_card(_top_n_other(role_df, "role_name", "attributed_credits"), bar, "period", "attributed_credits", "role_name", title="Estimated credits by role", tick=tick)
     with col2:
         chart_card(_top_n_other(query_type_df, "query_type", "attributed_credits"), bar, "period", "attributed_credits", "query_type", title="Estimated credits by query type", tick=tick)
     col3, col4 = st.columns(2)
@@ -734,11 +612,33 @@ with tab_finops:
 
 # ── Warehouse performance ──────────────────────────────────────────────────────
 
-with tab_wh:
+elif _active_tab == _TAB_LABELS[3]:
+    with st.spinner("Loading warehouse performance…"):
+        wh_perf_df = q_wh_perf_combined(trunc, days, cm)
+        top_cost_df = q_top_cost_queries(days, cm)
+
+    if not wh_perf_df.empty:
+        queuing_trend_df = wh_perf_df.groupby(["period", "warehouse_name"], as_index=False).agg(
+            queued_count=("queued_count", "sum"),
+            avg_overload_wait_sec=("avg_overload_wait_sec", "mean"))
+        queuing_summary_df = wh_perf_df.groupby(["warehouse_name", "warehouse_size"], as_index=False).agg(
+            total_queries=("total_queries", "sum"),
+            queued_queries=("queued_count", "sum"))
+        queuing_summary_df["pct_queued"] = (100.0 * queuing_summary_df["queued_queries"] / queuing_summary_df["total_queries"]).round(1)
+        queuing_summary_df["avg_wait_sec"] = wh_perf_df.groupby(["warehouse_name", "warehouse_size"])["avg_overload_wait_sec"].mean().values
+        queuing_summary_df = queuing_summary_df.sort_values("pct_queued", ascending=False)
+        spilling_df = wh_perf_df.loc[wh_perf_df["remote_spill_gb"] > 0].groupby(
+            ["warehouse_name", "warehouse_size"], as_index=False).agg(
+            spilling_queries=("spilling_queries", "sum"),
+            remote_spill_gb=("remote_spill_gb", "sum"),
+            local_spill_gb=("local_spill_gb", "sum")).sort_values("remote_spill_gb", ascending=False)
+    else:
+        queuing_trend_df = queuing_summary_df = spilling_df = pd.DataFrame()
+
     st.subheader(":material/schedule: Queuing")
     col1, col2 = st.columns(2)
     with col1:
-        chart_card(_top_n_other(queuing_trend_df, "warehouse_name", "queued_count"),         bar, "period", "queued_count",         "warehouse_name", title="Queued queries over time",    tick=tick)
+        chart_card(_top_n_other(queuing_trend_df, "warehouse_name", "queued_count"), bar, "period", "queued_count", "warehouse_name", title="Queued queries over time", tick=tick)
     with col2:
         chart_card(_top_n_other(queuing_trend_df, "warehouse_name", "avg_overload_wait_sec"), bar, "period", "avg_overload_wait_sec", "warehouse_name", title="Avg overload wait (seconds)", tick=tick)
 
@@ -747,20 +647,20 @@ with tab_wh:
             st.subheader("Queuing summary by warehouse")
             st.dataframe(queuing_summary_df, hide_index=True, use_container_width=True, column_config={
                 "warehouse_name": "Warehouse", "warehouse_size": "Size",
-                "total_queries":  st.column_config.NumberColumn("Total queries",  format="%d"),
+                "total_queries":  st.column_config.NumberColumn("Total queries", format="%d"),
                 "queued_queries": st.column_config.NumberColumn("Queued queries", format="%d"),
-                "pct_queued":     st.column_config.NumberColumn("% queued",       format="%.1f%%"),
-                "avg_wait_sec":   st.column_config.NumberColumn("Avg wait (s)",   format="%.2f"),
+                "pct_queued":     st.column_config.NumberColumn("% queued", format="%.1f%%"),
+                "avg_wait_sec":   st.column_config.NumberColumn("Avg wait (s)", format="%.2f"),
             })
 
     st.subheader(":material/storage: Remote storage spilling")
     if not spilling_df.empty:
         with st.container(border=True):
             st.dataframe(spilling_df, hide_index=True, use_container_width=True, column_config={
-                "warehouse_name":   "Warehouse", "warehouse_size": "Size",
+                "warehouse_name":  "Warehouse", "warehouse_size": "Size",
                 "spilling_queries": st.column_config.NumberColumn("Spilling queries", format="%d"),
-                "remote_spill_gb":  st.column_config.NumberColumn("Remote spill (GB)", format="%.2f"),
-                "local_spill_gb":   st.column_config.NumberColumn("Local spill (GB)",  format="%.2f"),
+                "remote_spill_gb": st.column_config.NumberColumn("Remote spill (GB)", format="%.2f"),
+                "local_spill_gb":  st.column_config.NumberColumn("Local spill (GB)", format="%.2f"),
             })
     else:
         st.caption("No remote storage spilling detected in this period.")
@@ -770,21 +670,81 @@ with tab_wh:
     if not top_cost_df.empty:
         with st.container(border=True):
             st.dataframe(top_cost_df, hide_index=True, use_container_width=True, column_config={
-                "execution_count":    st.column_config.NumberColumn("Executions",    format="%d"),
-                "avg_exec_seconds":   st.column_config.NumberColumn("Avg exec (s)",  format="%.2f"),
-                "user_name":          st.column_config.TextColumn(  "User"),
-                "role_name":          st.column_config.TextColumn(  "Role"),
-                "warehouse_name":     st.column_config.TextColumn(  "Warehouse"),
-                "sample_query_id":    st.column_config.TextColumn(  "Sample query ID", width="small"),
-                "sample_query":       st.column_config.TextColumn(  "Query (sample)",  width="large"),
-                "attributed_credits": st.column_config.NumberColumn("Credits",        format="%.4f"),
+                "execution_count":    st.column_config.NumberColumn("Executions", format="%d"),
+                "avg_exec_seconds":   st.column_config.NumberColumn("Avg exec (s)", format="%.2f"),
+                "user_name":          st.column_config.TextColumn("User"),
+                "role_name":          st.column_config.TextColumn("Role"),
+                "warehouse_name":     st.column_config.TextColumn("Warehouse"),
+                "sample_query_id":    st.column_config.TextColumn("Sample query ID", width="small"),
+                "sample_query":       st.column_config.TextColumn("Query (sample)", width="large"),
+                "attributed_credits": st.column_config.NumberColumn("Credits", format="%.4f"),
             })
     else:
         st.caption("No query data available for this period.")
 
 # ── Security ───────────────────────────────────────────────────────────────────
 
-with tab_sec:
+elif _active_tab == _TAB_LABELS[4]:
+    with st.spinner("Loading security data…"):
+        user_base_df = q_user_base()
+
+    now_ts = pd.Timestamp.now(tz="UTC")
+
+    def _to_utc(val):
+        ts = pd.Timestamp(val)
+        return ts if ts.tzinfo is not None else ts.tz_localize("UTC")
+
+    def _derive_stale(df, threshold):
+        if df.empty:
+            return pd.DataFrame()
+        d = df.copy()
+        d["days_since_login"] = d.apply(
+            lambda r: (now_ts - _to_utc(r["last_success_login"] if pd.notna(r["last_success_login"]) else r["created_on"])).days, axis=1)
+        return d.loc[d["days_since_login"] >= threshold, ["name", "days_since_login"]].sort_values("days_since_login", ascending=False).head(50)
+
+    def _derive_old_pwd(df):
+        if df.empty:
+            return pd.DataFrame()
+        d = df.loc[df["password_last_set_time"].notna()].copy()
+        d["password_age_days"] = d["password_last_set_time"].apply(lambda x: (now_ts - _to_utc(x)).days)
+        return d[["name", "password_age_days"]].sort_values("password_age_days", ascending=False).head(30)
+
+    def _derive_human_no_mfa(df):
+        if df.empty:
+            return pd.DataFrame()
+        mask = ((df["type"].isna()) | (df["type"].isin(["PERSON", ""]))) & (df["has_password"] == True) & (df["has_mfa"] == False)
+        d = df.loc[mask].copy()
+        d["days_since_login"] = d.apply(
+            lambda r: (now_ts - _to_utc(r["last_success_login"] if pd.notna(r["last_success_login"]) else r["created_on"])).days, axis=1)
+        return d[["name", "email", "has_rsa_public_key", "days_since_login"]].sort_values("days_since_login")
+
+    def _derive_svc_pwd(df):
+        if df.empty:
+            return pd.DataFrame()
+        mask = (df["type"] == "SERVICE") & (df["has_password"] == True)
+        return df.loc[mask, ["name", "has_rsa_public_key", "default_role"]].sort_values("name")
+
+    def _derive_default_aa(df):
+        if df.empty:
+            return pd.DataFrame()
+        mask = df["default_role"] == "ACCOUNTADMIN"
+        d = df.loc[mask].copy()
+        d["user_type"] = d["type"].fillna("LEGACY")
+        return d[["name", "user_type", "email"]].sort_values("name")
+
+    def _derive_legacy_type(df):
+        if df.empty:
+            return pd.DataFrame()
+        mask = df["type"].isna() | (df["type"] == "")
+        return df.loc[mask, ["name", "email", "has_password", "has_rsa_public_key", "has_mfa"]].sort_values("name")
+
+    stale_df       = _derive_stale(user_base_df, stale_threshold)
+    old_pwd_df     = _derive_old_pwd(user_base_df)
+    human_no_mfa_df = _derive_human_no_mfa(user_base_df)
+    svc_pwd_df     = _derive_svc_pwd(user_base_df)
+    default_aa_df  = _derive_default_aa(user_base_df)
+    legacy_type_df = _derive_legacy_type(user_base_df)
+
     s1, s2, s3, s4, s5, s6 = st.tabs([
         ":material/lock: Authentication",
         ":material/admin_panel_settings: Privileged access",
@@ -795,6 +755,10 @@ with tab_sec:
     ])
 
     with s1:
+        with st.spinner("Loading auth data…"):
+            failures_trend_df  = q_login_failures_trend(trunc, days, cm)
+            failures_detail_df = q_login_failures_detail(days, cm)
+            auth_methods_df    = q_auth_methods(days, cm)
         col1, col2 = st.columns(2)
         with col1:
             chart_card(_top_n_other(failures_trend_df, "error_message", "failures"), bar, "period", "failures", "error_message", title="Login failures over time", tick=tick)
@@ -809,6 +773,9 @@ with tab_sec:
                 })
 
     with s2:
+        with st.spinner("Loading privileged access…"):
+            aa_grants_df = q_aa_grants(days, cm)
+            aa_no_mfa_df = q_aa_no_mfa()
         if not aa_grants_df.empty:
             with st.container(border=True):
                 st.subheader("ACCOUNTADMIN grants")
@@ -848,12 +815,14 @@ with tab_sec:
                     })
 
     with s4:
+        with st.spinner("Loading privilege data…"):
+            privileged_df = q_most_privileged()
         if not privileged_df.empty:
             with st.container(border=True):
                 st.subheader("Most privileged users")
                 st.dataframe(privileged_df, hide_index=True, use_container_width=True, column_config={
                     "user_name": "User",
-                    "num_roles": st.column_config.NumberColumn("Roles",            format="%d"),
+                    "num_roles": st.column_config.NumberColumn("Roles", format="%d"),
                     "num_privs": st.column_config.NumberColumn("Total privileges", format="%d"),
                 })
 
@@ -905,6 +874,9 @@ with tab_sec:
                     })
             else:
                 st.caption(":material/check_circle: All users have a TYPE set.")
+        with st.spinner("Loading policy assignments…"):
+            user_net_pol_df  = q_user_network_policies()
+            user_auth_pol_df = q_user_auth_policies()
         if not user_net_pol_df.empty:
             with st.container(border=True):
                 st.subheader("Network policy assignments")
@@ -919,6 +891,9 @@ with tab_sec:
                 })
 
     with s6:
+        with st.spinner("Loading config changes…"):
+            config_df  = q_config_changes(days, cm)
+            network_df = q_network_policy_changes(days, cm)
         if not config_df.empty:
             with st.container(border=True):
                 st.subheader("Privileged object changes")
